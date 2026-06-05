@@ -1,0 +1,57 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Inter:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#050B14] text-slate-200 antialiased overflow-x-hidden;
+    font-family: 'Outfit', 'Inter', system-ui, -apple-system, sans-serif;
+    /* Enterprise dark mode grid background */
+    background-image: linear-gradient(to right, rgba(255,255,255,0.02) 1px, transparent 1px),
+                      linear-gradient(to bottom, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 50px 50px;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply backdrop-blur-glass bg-card border border-cardBorder shadow-glass;
+  }
+  
+  .glass-card {
+    @apply glass rounded-[2rem] p-8 transition-all duration-500;
+  }
+  .glass-card:hover {
+    @apply bg-slate-800/50 border-white/20;
+    box-shadow: 0 12px 40px -10px rgba(37, 99, 235, 0.4);
+  }
+
+  .orb {
+    @apply absolute rounded-full blur-[120px] opacity-30 animate-float pointer-events-none;
+  }
+
+  .btn-premium {
+    @apply relative overflow-hidden bg-primary text-white font-bold py-3 px-8 rounded-2xl shadow-glow hover:bg-primary-dark transition-all duration-300 transform active:scale-95;
+  }
+
+  .btn-premium::after {
+    content: '';
+    @apply absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-[150%] transition-transform duration-700 ease-in-out;
+  }
+
+  .btn-premium:hover::after {
+    @apply translate-x-[150%];
+  }
+
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-slate-700/50 rounded-full hover:bg-slate-600;
+  }
+}
