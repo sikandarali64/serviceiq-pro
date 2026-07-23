@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { LayoutDashboard, Users, CheckCircle2, DollarSign, AlertOctagon, BrainCircuit, Activity, BarChart2 } from 'lucide-react';
-import { db } from '../mockFirebase';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import { api, supabase } from '../api';
+import { BarChart, Bar, XAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
 export default function AdminDashboard() {
   const [stats, setStats] = useState({
@@ -11,73 +11,46 @@ export default function AdminDashboard() {
     completedJobs: 0,
     cancelledJobs: 0,
     revenue: 0,
+    demands: []
   });
   const [jobs, setJobs] = useState([]);
   const [aiLogs, setAiLogs] = useState([]);
 
+  const loadData = async () => {
+    try {
+      const [metricsRes, jobsRes, logsRes] = await Promise.all([
+        api.get('/api/admin/metrics'),
+        api.get('/api/jobs'),
+        api.get('/api/admin/logs')
+      ]);
+      setStats(metricsRes.data);
+      setJobs(jobsRes.data);
+      setAiLogs(logsRes.data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   useEffect(() => {
-    const loadData = () => {
-      const allJobs = db.getJobs();
-      const allWorkers = db.getWorkers();
-
-      const completed = allJobs.filter(j => j.status === 'completed').length;
-      const cancelled = allJobs.filter(j => j.status === 'cancelled').length;
-
-      // InDrive Model Revenue:
-      // Platform earns ONLY from workers:
-      //   - Rs. 150 registration fee per worker
-      //   - 20% commission per completed job (Rs. 100 per Rs. 500 job)
-      // Customers pay NOTHING to platform.
-      const workerCommissions = allJobs
-        .filter(j => j.status === 'completed')
-        .reduce((sum, j) => sum + (j.commissionDeducted || 100), 0);
-      const registrationFees = allWorkers.length * 150;
-      const calculatedRevenue = workerCommissions + registrationFees;
-
-      setStats({
-        totalJobs: allJobs.length,
-        activeWorkers: allWorkers.filter(w => w.isAvailable).length,
-        completedJobs: completed,
-        cancelledJobs: cancelled,
-        revenue: calculatedRevenue,
-      });
-
-      setJobs(allJobs.slice().reverse()); // newest first
-
-      const logs = allJobs
-        .filter(j => j.aiReasoning)
-        .map(j => ({ id: j.id, text: j.aiReasoning, time: j.createdAt || new Date().toISOString() }))
-        .slice().reverse();
-
-      setAiLogs(logs);
-    };
-
     loadData();
-    const unsubscribe = db.subscribe(loadData);
-    return unsubscribe;
+
+    const channel = supabase.channel('admin_updates')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'jobs' }, () => loadData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'workers' }, () => loadData())
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ai_decision_logs' }, () => loadData())
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
-  const simulateIncident = () => {
-    // Make 2 random workers unavailable
-    const workers = db.getWorkers();
-    const available = workers.filter(w => w.isAvailable);
-    if (available.length > 0) {
-      db.updateWorker(available[0].id, { isAvailable: false });
-      if (available.length > 1) {
-        db.updateWorker(available[1].id, { isAvailable: false });
-      }
+  const simulateIncident = async () => {
+    try {
+      await api.post('/api/admin/simulate');
+    } catch (err) {
+      console.error(err);
     }
-    // Add a pending job
-    db.addJob({
-      customerName: 'Emergency Alert',
-      serviceType: 'electrician',
-      description: 'Main power line failure!',
-      status: 'pending',
-      workerId: null,
-      amountPaid: 0,
-      aiReasoning: 'Emergency! Recalculating routes. No available electricians in 5km radius.',
-      createdAt: new Date().toISOString()
-    });
   };
 
   const cards = [
@@ -103,11 +76,9 @@ export default function AdminDashboard() {
         </button>
       </div>
 
-      {/* METRIC CARDS */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         {cards.map((card, idx) => {
           const Icon = card.icon;
-          // Tailwind dynamic classes can be tricky, so we map explicitly
           const colorStyles = {
             blue: 'text-blue-400 bg-blue-500/10 border-blue-500/20',
             emerald: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20',
@@ -138,14 +109,11 @@ export default function AdminDashboard() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-
-        {/* DEMAND CHART & LIVE JOBS TABLE */}
         <motion.div
           initial={{ opacity: 0, x: -20 }}
           animate={{ opacity: 1, x: 0 }}
           className="lg:col-span-2 space-y-8"
         >
-          {/* DEMAND CHART */}
           <div className="glass-card">
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-xl font-bold text-white flex items-center">
@@ -155,23 +123,15 @@ export default function AdminDashboard() {
             </div>
             <div className="h-[200px] w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={[
-                  { name: 'Elec', count: jobs.filter(j => j.serviceType === 'electrician').length },
-                  { name: 'Plumb', count: jobs.filter(j => j.serviceType === 'plumber').length },
-                  { name: 'House Cln', count: jobs.filter(j => j.serviceType === 'house_cleaning').length },
-                  { name: 'AC Rep', count: jobs.filter(j => j.serviceType === 'ac_repair').length },
-                  { name: 'Sofa Cln', count: jobs.filter(j => j.serviceType === 'sofa_cleaning').length },
-                  { name: 'Fridge', count: jobs.filter(j => j.serviceType === 'fridge_repair').length }
-                ]}>
+                <BarChart data={stats.demands}>
                   <XAxis dataKey="name" stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
                   <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px' }} />
-                  <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="value" fill="#3b82f6" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
           </div>
 
-          {/* LIVE JOBS TABLE */}
           <div className="glass-card overflow-hidden flex flex-col">
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-xl font-bold text-white flex items-center">
@@ -193,9 +153,9 @@ export default function AdminDashboard() {
                 <tbody className="divide-y divide-slate-800">
                   {jobs.slice(0, 10).map(job => (
                     <tr key={job.id} className="text-sm">
-                      <td className="py-4 text-slate-400">{job.id}</td>
-                      <td className="py-4 text-white font-medium">{job.customerName}</td>
-                      <td className="py-4 text-slate-300 capitalize">{job.serviceType}</td>
+                      <td className="py-4 text-slate-400">{job.id.substring(0,8)}</td>
+                      <td className="py-4 text-white font-medium">{job.customer_name}</td>
+                      <td className="py-4 text-slate-300 capitalize">{job.service_type}</td>
                       <td className="py-4">
                         <span className={`px-2.5 py-1 rounded-full text-xs font-bold ${
                           job.status === 'completed' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
@@ -218,7 +178,6 @@ export default function AdminDashboard() {
           </div>
         </motion.div>
 
-        {/* AI DECISION LOG */}
         <motion.div
           initial={{ opacity: 0, x: 20 }}
           animate={{ opacity: 1, x: 0 }}
@@ -237,13 +196,13 @@ export default function AdminDashboard() {
               <div className="text-center py-8 text-slate-500">No decisions recorded</div>
             ) : (
               aiLogs.map((log, i) => (
-                <div key={i} className="bg-slate-900/60 p-4 rounded-xl border border-slate-800/50">
+                <div key={log.id} className="bg-slate-900/60 p-4 rounded-xl border border-slate-800/50">
                   <div className="text-xs text-slate-500 mb-1 flex items-center justify-between">
-                    <span>Job: {log.id}</span>
-                    <span>{new Date(log.time).toLocaleTimeString()}</span>
+                    <span>Job: {log.jobId.substring(0,8)}</span>
+                    <span>{new Date(log.timestamp).toLocaleTimeString()}</span>
                   </div>
                   <p className="text-sm text-slate-300 font-medium leading-relaxed">
-                    "{log.text}"
+                    "{log.reasoning}"
                   </p>
                 </div>
               ))
@@ -251,7 +210,6 @@ export default function AdminDashboard() {
           </div>
         </motion.div>
       </div>
-
     </div>
   );
 }

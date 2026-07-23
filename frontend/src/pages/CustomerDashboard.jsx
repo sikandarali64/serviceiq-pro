@@ -1,9 +1,7 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { MapPin, Briefcase, Wrench, CheckCircle2, Star, Clock, AlertCircle, XCircle, ShieldAlert, ArrowRight, PhoneCall, Sparkles, Wind, Zap, Droplets, Thermometer, Home } from 'lucide-react';
-import { db } from '../mockFirebase';
-
-const COMMISSION_RATE = 0.20; // 20% from worker wallet on completion
+import { MapPin, CheckCircle2, Star, AlertCircle, XCircle, ShieldAlert, ArrowRight, PhoneCall, Sparkles, Wind, Zap, Droplets, Thermometer, Home } from 'lucide-react';
+import { api, supabase } from '../api';
 
 export default function CustomerDashboard() {
   const [formData, setFormData] = useState({
@@ -17,7 +15,7 @@ export default function CustomerDashboard() {
   const [currentJob, setCurrentJob] = useState(null);
   const [assignedWorker, setAssignedWorker] = useState(null);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
-  const [cancelWarning, setCancelWarning] = useState(null); // warning result after cancel
+  const [cancelWarning, setCancelWarning] = useState(null);
 
   const serviceCategories = [
     {
@@ -39,26 +37,36 @@ export default function CustomerDashboard() {
       category: 'Maintenance',
       items: [
         { id: 'electrician', name: 'Electrician', icon: <Zap className="w-5 h-5 mb-1" /> },
-        { id: 'plumber', name: 'Plumber', icon: <Wrench className="w-5 h-5 mb-1" /> },
+        { id: 'plumber', name: 'Plumber', icon: <Zap className="w-5 h-5 mb-1" /> },
       ]
     }
   ];
 
-  // Track live job status changes
+  // Track live job status changes via Supabase
   useEffect(() => {
-    if (step === 'tracking' && currentJob) {
-      const refresh = () => {
-        const updated = db.getJobs().find(j => j.id === currentJob.id);
-        if (updated) setCurrentJob(updated);
-        if (updated?.workerId) {
-          const w = db.getWorkers().find(w => w.id === updated.workerId);
-          if (w) setAssignedWorker(w);
-        }
+    if (step === 'tracking' && currentJob?.id) {
+      const channel = supabase
+        .channel(`job_${currentJob.id}`)
+        .on(
+          'postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: 'jobs', filter: `id=eq.${currentJob.id}` },
+          async (payload) => {
+            setCurrentJob(payload.new);
+            
+            // If worker changed/assigned, fetch worker
+            if (payload.new.worker_id) {
+              const { data: worker } = await supabase.from('workers').select('*').eq('id', payload.new.worker_id).single();
+              if (worker) setAssignedWorker(worker);
+            }
+          }
+        )
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
       };
-      const unsub = db.subscribe(refresh);
-      return unsub;
     }
-  }, [step, currentJob]);
+  }, [step, currentJob?.id]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -66,77 +74,44 @@ export default function CustomerDashboard() {
     setIsProcessing(true);
     setStep('processing');
 
-    // Simulate AI processing delay
-    await new Promise(resolve => setTimeout(resolve, 1800));
-
-    const workers = db.getWorkers();
-    let bestWorker = null;
-    let maxScore = -1;
-    let aiReasoning = '';
-
-    const customerDistance = parseFloat(formData.location) || Math.random() * 10 + 1;
-
-    workers.forEach(w => {
-      if (!w.isAvailable || !w.feePaid) return;
-      if (w.skill !== formData.serviceType) return;
-      if (w.walletBalance < 100) return; // Worker must have min balance
-
-      const distance = Math.abs(w.distance - customerDistance) || 0.1;
-      const score = ((1 / distance) * 40) + 30 + (w.rating * 20) + 10;
-
-      if (score > maxScore) {
-        maxScore = score;
-        bestWorker = w;
-        const eta = (Math.random() * 10 + 5).toFixed(0);
-        aiReasoning = `${w.name} selected — ${distance.toFixed(1)}km away, ${w.skill}, rating ${w.rating}★, ETA ~${eta} mins.`;
+    try {
+      const res = await api.post('/api/jobs', formData);
+      setCurrentJob(res.data.job);
+      if (res.data.job.worker_id) {
+        // Fetch the assigned worker manually for the initial state
+        const { data: worker } = await supabase.from('workers').select('*').eq('id', res.data.job.worker_id).single();
+        if (worker) setAssignedWorker(worker);
       }
-    });
-
-    const newJob = db.addJob({
-      customerName: formData.name,
-      serviceType: formData.serviceType,
-      description: formData.description,
-      status: bestWorker ? 'assigned' : 'pending',
-      workerId: bestWorker?.id || null,
-      aiReasoning: bestWorker ? aiReasoning : 'No worker available right now. Your request is queued.',
-    });
-
-    if (bestWorker) {
-      db.updateWorker(bestWorker.id, { isAvailable: false });
+    } catch (err) {
+      console.error('Error submitting job:', err);
+    } finally {
+      setIsProcessing(false);
+      setStep('tracking');
     }
-
-    setCurrentJob(newJob);
-    setAssignedWorker(bestWorker);
-    setIsProcessing(false);
-    setStep('tracking');
   };
 
-  // Customer cancel logic
-  const handleCancel = () => {
+  const handleCancel = async () => {
     if (!currentJob) return;
 
-    const job = db.getJobs().find(j => j.id === currentJob.id);
-    const workerArrived = job?.workerArrived;
+    const workerArrived = currentJob?.worker_arrived;
 
-    if (workerArrived) {
-      // Worker already arrived — customer will get a warning
-      db.updateJob(currentJob.id, { status: 'cancelled', cancelledBy: 'customer' });
-      if (assignedWorker) {
-        db.updateWorker(assignedWorker.id, { isAvailable: true });
+    try {
+      if (workerArrived) {
+        // Penalty logic
+        await api.put(`/api/jobs/${currentJob.id}/status`, { status: 'cancelled', cancelledBy: 'customer' });
+        const warnRes = await api.post('/api/customers/warn', { name: formData.name });
+        setCancelWarning({ warnings: warnRes.data.warning_strikes });
+      } else {
+        // No penalty
+        await api.put(`/api/jobs/${currentJob.id}/status`, { status: 'cancelled', cancelledBy: 'customer_before_arrival' });
+        setCancelWarning(null);
       }
-      const warningResult = db.warnCustomer(formData.name);
-      setCancelWarning(warningResult);
-    } else {
-      // Cancelled before worker arrived — no penalty
-      db.updateJob(currentJob.id, { status: 'cancelled', cancelledBy: 'customer_before_arrival' });
-      if (assignedWorker) {
-        db.updateWorker(assignedWorker.id, { isAvailable: true });
-      }
-      setCancelWarning(null);
+
+      setCurrentJob(prev => ({ ...prev, status: 'cancelled' }));
+      setShowCancelConfirm(false);
+    } catch (err) {
+      console.error('Error cancelling job:', err);
     }
-
-    setCurrentJob(prev => ({ ...prev, status: 'cancelled' }));
-    setShowCancelConfirm(false);
   };
 
   const resetForm = () => {
@@ -149,19 +124,16 @@ export default function CustomerDashboard() {
   };
 
   const jobStatus = currentJob?.status;
-  const workerArrived = currentJob?.workerArrived;
+  const workerArrived = currentJob?.worker_arrived;
 
   return (
     <div className="space-y-8 pb-12">
-      {/* Header */}
       <div>
         <h1 className="text-3xl font-black text-white">Customer Dashboard</h1>
         <p className="text-slate-400 mt-1">Book a service — completely free. Pay the worker directly in cash.</p>
       </div>
 
       <AnimatePresence mode="wait">
-
-        {/* ─── STEP 1: FORM ─── */}
         {step === 'form' && (
           <motion.div
             key="form"
@@ -177,7 +149,6 @@ export default function CustomerDashboard() {
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-5">
-                {/* Name */}
                 <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Your Name</label>
                   <input
@@ -188,7 +159,6 @@ export default function CustomerDashboard() {
                   />
                 </div>
 
-                {/* Service */}
                 <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">Service Type</label>
                   <div className="space-y-4">
@@ -219,7 +189,6 @@ export default function CustomerDashboard() {
                   </div>
                 </div>
 
-                {/* Location */}
                 <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Your Location (km from center)</label>
                   <div className="relative">
@@ -233,7 +202,6 @@ export default function CustomerDashboard() {
                   </div>
                 </div>
 
-                {/* Description */}
                 <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Problem Description</label>
                   <textarea
@@ -244,7 +212,6 @@ export default function CustomerDashboard() {
                   />
                 </div>
 
-                {/* Info box */}
                 <div className="bg-emerald-900/20 border border-emerald-500/30 rounded-xl p-4 flex items-start space-x-3">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
@@ -262,7 +229,6 @@ export default function CustomerDashboard() {
               </form>
             </div>
 
-            {/* Info panel */}
             <div className="hidden lg:flex flex-col gap-4">
               <div className="glass-card border-emerald-500/20">
                 <h3 className="text-lg font-bold text-white mb-3">🆓 How it works</h3>
@@ -293,7 +259,6 @@ export default function CustomerDashboard() {
           </motion.div>
         )}
 
-        {/* ─── STEP 2: PROCESSING ─── */}
         {step === 'processing' && (
           <motion.div
             key="processing"
@@ -301,7 +266,6 @@ export default function CustomerDashboard() {
             animate={{ opacity: 1, scale: 1 }}
             className="max-w-md mx-auto glass-card text-center py-16 relative overflow-hidden"
           >
-            {/* Radar Animation Background */}
             <div className="absolute inset-0 flex items-center justify-center opacity-20 pointer-events-none">
               <motion.div animate={{ scale: [1, 2, 2.5], opacity: [0.8, 0.4, 0] }} transition={{ duration: 2, repeat: Infinity, ease: "easeOut" }} className="absolute w-32 h-32 rounded-full border border-blue-500" />
               <motion.div animate={{ scale: [1, 2, 2.5], opacity: [0.8, 0.4, 0] }} transition={{ duration: 2, delay: 0.6, repeat: Infinity, ease: "easeOut" }} className="absolute w-32 h-32 rounded-full border border-blue-500" />
@@ -318,7 +282,6 @@ export default function CustomerDashboard() {
           </motion.div>
         )}
 
-        {/* ─── STEP 3: TRACKING ─── */}
         {step === 'tracking' && currentJob && (
           <motion.div
             key="tracking"
@@ -326,8 +289,6 @@ export default function CustomerDashboard() {
             animate={{ opacity: 1, y: 0 }}
             className="max-w-2xl mx-auto space-y-5"
           >
-
-            {/* Cancelled state */}
             {(jobStatus === 'cancelled') && (
               <div className="bg-slate-900/80 border border-slate-700 rounded-2xl p-6">
                 <div className="flex items-center gap-3 mb-4">
@@ -362,10 +323,8 @@ export default function CustomerDashboard() {
               </div>
             )}
 
-            {/* Active tracking */}
             {jobStatus !== 'cancelled' && (
               <>
-                {/* AI Result */}
                 <div className="glass-card border-blue-500/20">
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-lg font-bold text-white flex items-center gap-2">
@@ -377,13 +336,12 @@ export default function CustomerDashboard() {
                     </span>
                   </div>
                   <p className="text-slate-300 text-sm bg-slate-900/50 p-3 rounded-xl border border-slate-800">
-                    "{currentJob.aiReasoning}"
+                    "{currentJob.ai_reasoning}"
                   </p>
                 </div>
 
                 {assignedWorker ? (
                   <>
-                    {/* Worker card */}
                     <div className="glass-card">
                       <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4">Assigned Expert</h3>
                       <div className="flex items-center space-x-4 mb-6">
@@ -404,7 +362,6 @@ export default function CustomerDashboard() {
                         </div>
                       </div>
 
-                      {/* Status Timeline */}
                       <div className="relative pl-6 border-l-2 border-slate-800 space-y-5">
                         <div className="relative">
                           <div className={`absolute w-3 h-3 rounded-full -left-[31px] top-1 ${
@@ -429,7 +386,6 @@ export default function CustomerDashboard() {
                         </div>
                       </div>
 
-                      {/* Pay in cash reminder */}
                       {jobStatus === 'completed' && (
                         <div className="mt-5 bg-emerald-900/30 border border-emerald-500/30 rounded-xl p-4 flex items-start gap-3">
                           <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
@@ -441,7 +397,6 @@ export default function CustomerDashboard() {
                       )}
                     </div>
 
-                    {/* Cancel / Warning section */}
                     {(jobStatus === 'assigned' || jobStatus === 'arrived') && (
                       <div>
                         {!showCancelConfirm ? (
@@ -453,11 +408,11 @@ export default function CustomerDashboard() {
                           </button>
                         ) : (
                           <div className={`rounded-2xl p-5 border space-y-4 ${
-                            currentJob.workerArrived
+                            currentJob.worker_arrived
                               ? 'bg-red-900/20 border-red-500/30'
                               : 'bg-slate-900/80 border-slate-700'
                           }`}>
-                            {currentJob.workerArrived ? (
+                            {currentJob.worker_arrived ? (
                               <div className="flex items-start gap-3">
                                 <ShieldAlert className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
                                 <div>
@@ -482,7 +437,7 @@ export default function CustomerDashboard() {
                                 onClick={handleCancel}
                                 className="flex-1 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-sm transition-colors"
                               >
-                                Confirm Cancel {currentJob.workerArrived ? '(Get Warning)' : ''}
+                                Confirm Cancel {currentJob.worker_arrived ? '(Get Warning)' : ''}
                               </button>
                             </div>
                           </div>
@@ -497,7 +452,6 @@ export default function CustomerDashboard() {
                     )}
                   </>
                 ) : (
-                  // No worker available
                   <div className="glass-card text-center py-10">
                     <AlertCircle className="w-12 h-12 text-yellow-500 mx-auto mb-4" />
                     <h3 className="text-xl font-bold text-white mb-2">No Workers Available</h3>

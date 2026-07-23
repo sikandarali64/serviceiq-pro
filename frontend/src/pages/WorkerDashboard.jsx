@@ -1,9 +1,7 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Wallet, Briefcase, MapPin, User, Hash, Phone, Clock, Star, CheckCircle2, AlertCircle, PlusCircle, X, Navigation, XCircle, ShieldAlert, TrendingDown } from 'lucide-react';
-import { db } from '../mockFirebase';
-
-const COMMISSION_RATE = 0.20; // 20% from worker wallet on each completed job
+import { api, supabase } from '../api';
 
 export default function WorkerDashboard() {
   const [worker, setWorker] = useState(null);
@@ -23,116 +21,126 @@ export default function WorkerDashboard() {
   const [completedJobs, setCompletedJobs] = useState([]);
   const [cancelledJobs, setCancelledJobs] = useState([]);
 
-  // Live refresh of jobs
+  const loadJobs = async () => {
+    if (!worker) return;
+    try {
+      const { data: jobs } = await api.get('/api/jobs');
+      setActiveJobs(jobs.filter(j => j.worker_id === worker.id && ['assigned', 'arrived'].includes(j.status)));
+      setCompletedJobs(jobs.filter(j => j.worker_id === worker.id && j.status === 'completed'));
+      setCancelledJobs(jobs.filter(j => j.worker_id === worker.id && j.status === 'cancelled'));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const loadWorker = async () => {
+    if (!worker) return;
+    try {
+      const { data } = await supabase.from('workers').select('*').eq('id', worker.id).single();
+      if (data) setWorker(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   useEffect(() => {
     if (step === 'dashboard' && worker) {
-      const loadJobs = () => {
-        const allJobs = db.getJobs();
-        setActiveJobs(allJobs.filter(j => j.workerId === worker.id && ['assigned', 'arrived'].includes(j.status)));
-        setCompletedJobs(allJobs.filter(j => j.workerId === worker.id && j.status === 'completed'));
-        setCancelledJobs(allJobs.filter(j => j.workerId === worker.id && j.status === 'cancelled'));
-        // Sync worker state
-        const updated = db.getWorkers().find(w => w.id === worker.id);
-        if (updated) setWorker(updated);
-      };
       loadJobs();
-      const unsub = db.subscribe(loadJobs);
-      return unsub;
+      loadWorker();
+
+      const jobChannel = supabase.channel('worker_jobs')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'jobs' }, () => {
+          loadJobs();
+          loadWorker(); // Status might change based on jobs
+        })
+        .subscribe();
+
+      const workerChannel = supabase.channel('worker_status')
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'workers', filter: `id=eq.${worker.id}` }, (payload) => {
+          setWorker(payload.new);
+        })
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(jobChannel);
+        supabase.removeChannel(workerChannel);
+      };
     }
   }, [step, worker?.id]);
 
-  const handleRegister = (e) => {
+  const handleRegister = async (e) => {
     e.preventDefault();
     if (!formData.name || !formData.cnic || !formData.distance) return;
-    handleActivate();
-  };
-
-  const handleActivate = async () => {
     setIsProcessing(true);
-    await new Promise(resolve => setTimeout(resolve, 1400));
-
-    const newWorker = db.addWorker({
-      ...formData,
-      distance: parseFloat(formData.distance),
-      rating: 5.0,
-      isAvailable: true,
-      feePaid: true,
-      walletBalance: 500, // Starting balance (registration fee already included in demo)
-    });
-
-    setWorker(newWorker);
-    setIsProcessing(false);
-    setStep('dashboard');
+    try {
+      const { data } = await api.post('/api/workers', formData);
+      setWorker(data);
+      setStep('dashboard');
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
-  const toggleAvailability = () => {
-    const w = db.getWorkers().find(w => w.id === worker.id);
-    if (!w.isAvailable && w.walletBalance < 100) {
+  const toggleAvailability = async () => {
+    if (!worker.is_available && worker.wallet_balance < 100) {
       alert('Minimum Rs. 100 required in your Prepaid Wallet to go Online. Please top up.');
       return;
     }
-    const newStatus = !w.isAvailable;
-    db.updateWorker(worker.id, { isAvailable: newStatus });
-    setWorker({ ...w, isAvailable: newStatus });
-  };
-
-  // Worker marks they've arrived at customer location
-  const markArrived = (jobId) => {
-    db.updateJob(jobId, { workerArrived: true, status: 'arrived' });
-  };
-
-  // Worker completes job → commission deducted from wallet
-  const completeJob = (jobId) => {
-    const job = db.getJobs().find(j => j.id === jobId);
-    if (!job) return;
-
-    const jobValue = 500; // Standard job value (agreed in cash with customer)
-    const commission = Math.round(jobValue * COMMISSION_RATE); // 20% = Rs. 100
-    const w = db.getWorkers().find(w => w.id === worker.id);
-    const newBalance = (w.walletBalance || 0) - commission;
-
-    let newStatus = true;
-    let msg = `✅ Job completed!\n\nRs. ${commission} commission deducted from your wallet.\nNew wallet balance: Rs. ${newBalance}`;
-
-    if (newBalance < 100) {
-      newStatus = false;
-      msg += '\n\n⚠️ Low balance! You are now Offline. Please top up to receive more jobs.';
+    const newStatus = !worker.is_available;
+    try {
+      const { data } = await api.put(`/api/workers/${worker.id}/status`, { isAvailable: newStatus });
+      setWorker(data);
+    } catch (err) {
+      console.error(err);
     }
-
-    db.updateJob(jobId, { status: 'completed', commissionDeducted: commission, workerArrived: true });
-    db.updateWorker(worker.id, { isAvailable: newStatus, walletBalance: newBalance });
-    setWorker(prev => ({ ...prev, isAvailable: newStatus, walletBalance: newBalance }));
-
-    alert(msg);
   };
 
-  // Worker cancels job (no commission deducted)
-  const cancelJob = (jobId) => {
-    const job = db.getJobs().find(j => j.id === jobId);
-    if (!job) return;
+  const markArrived = async (jobId) => {
+    try {
+      await api.put(`/api/jobs/${jobId}/status`, { status: 'arrived', workerArrived: true });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const completeJob = async (jobId) => {
+    try {
+      await api.put(`/api/jobs/${jobId}/status`, { status: 'completed' });
+      alert('✅ Job completed! Commission has been automatically deducted from your wallet.');
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const cancelJob = async (jobId) => {
     if (!confirm('Are you sure you want to cancel this job? No commission will be deducted.')) return;
-    db.updateJob(jobId, { status: 'cancelled', cancelledBy: 'worker' });
-    db.updateWorker(worker.id, { isAvailable: true });
-    setWorker(prev => ({ ...prev, isAvailable: true }));
+    try {
+      await api.put(`/api/jobs/${jobId}/status`, { status: 'cancelled', cancelledBy: 'worker' });
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   const handleTopUp = async () => {
     setIsProcessing(true);
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    const w = db.getWorkers().find(w => w.id === worker.id);
-    const newBalance = (w.walletBalance || 0) + Number(topUpAmount);
-    db.updateWorker(worker.id, { walletBalance: newBalance });
-    setWorker(prev => ({ ...prev, walletBalance: newBalance }));
-    setIsProcessing(false);
-    setShowTopUp(false);
+    try {
+      const { data } = await api.post(`/api/workers/${worker.id}/topup`, { amount: topUpAmount });
+      setWorker(data);
+      setShowTopUp(false);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
-  const totalEarnings = completedJobs.length * 500; // Worker gets Rs. 500 cash per job
-  const totalCommission = completedJobs.reduce((sum, j) => sum + (j.commissionDeducted || 100), 0);
+  const totalEarnings = completedJobs.length * 500;
+  const totalCommission = completedJobs.reduce((sum, j) => sum + Number(j.commission_deducted || 0), 0);
 
   return (
     <div className="space-y-8 pb-12">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-black text-white">Worker Dashboard</h1>
@@ -143,17 +151,15 @@ export default function WorkerDashboard() {
             <span className="text-sm font-bold text-slate-300">Status</span>
             <button
               onClick={toggleAvailability}
-              className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${worker.isAvailable ? 'bg-green-500' : 'bg-slate-600'}`}
+              className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${worker.is_available ? 'bg-green-500' : 'bg-slate-600'}`}
             >
-              <span className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${worker.isAvailable ? 'translate-x-7' : 'translate-x-1'}`} />
+              <span className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${worker.is_available ? 'translate-x-7' : 'translate-x-1'}`} />
             </button>
           </div>
         )}
       </div>
 
       <AnimatePresence mode="wait">
-
-        {/* ─── REGISTER FORM ─── */}
         {step === 'register' && (
           <motion.div
             key="register"
@@ -241,7 +247,6 @@ export default function WorkerDashboard() {
                 </div>
               </div>
 
-              {/* Commission info */}
               <div className="bg-blue-900/20 border border-blue-500/30 rounded-xl p-4 space-y-2">
                 <p className="text-sm font-bold text-blue-100 flex items-center gap-2">
                   <TrendingDown className="w-4 h-4 text-blue-400" /> Commission Model (InDrive Style)
@@ -268,7 +273,6 @@ export default function WorkerDashboard() {
           </motion.div>
         )}
 
-        {/* ─── DASHBOARD ─── */}
         {step === 'dashboard' && worker && (
           <motion.div
             key="dashboard"
@@ -276,10 +280,7 @@ export default function WorkerDashboard() {
             animate={{ opacity: 1, y: 0 }}
             className="space-y-6"
           >
-            {/* Stats row */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-
-              {/* Profile */}
               <div className="glass-card flex flex-col items-center text-center">
                 <div className="w-24 h-24 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-3xl font-black text-white mb-4">
                   {worker.name.charAt(0)}
@@ -288,14 +289,13 @@ export default function WorkerDashboard() {
                 <p className="text-purple-400 capitalize font-medium">{worker.skill} Expert</p>
                 <div className="flex items-center mt-3 text-yellow-500 font-bold bg-yellow-500/10 px-3 py-1 rounded-full">
                   <Star className="w-4 h-4 mr-1 fill-current" />
-                  {worker.rating?.toFixed(1)} Rating
+                  {Number(worker.rating).toFixed(1)} Rating
                 </div>
-                <div className={`mt-3 px-3 py-1 rounded-full text-xs font-bold ${worker.isAvailable ? 'bg-green-500/20 text-green-400' : 'bg-slate-700 text-slate-400'}`}>
-                  {worker.isAvailable ? '🟢 Online' : '⚫ Offline'}
+                <div className={`mt-3 px-3 py-1 rounded-full text-xs font-bold ${worker.is_available ? 'bg-green-500/20 text-green-400' : 'bg-slate-700 text-slate-400'}`}>
+                  {worker.is_available ? '🟢 Online' : '⚫ Offline'}
                 </div>
               </div>
 
-              {/* Wallet */}
               <div className="glass-card flex flex-col justify-center border-orange-500/20 relative overflow-hidden">
                 <div className="absolute top-0 right-0 w-24 h-24 bg-orange-500/10 rounded-full blur-2xl" />
                 <div className="flex items-center space-x-4 mb-2">
@@ -304,12 +304,12 @@ export default function WorkerDashboard() {
                   </div>
                   <div>
                     <h3 className="text-slate-400 font-medium">Prepaid Wallet</h3>
-                    <p className={`text-3xl font-black ${(worker.walletBalance || 0) < 100 ? 'text-red-400' : 'text-white'}`}>
-                      Rs. {(worker.walletBalance || 0).toFixed(0)}
+                    <p className={`text-3xl font-black ${Number(worker.wallet_balance) < 100 ? 'text-red-400' : 'text-white'}`}>
+                      Rs. {Number(worker.wallet_balance).toFixed(0)}
                     </p>
                   </div>
                 </div>
-                {(worker.walletBalance || 0) < 100 && (
+                {Number(worker.wallet_balance) < 100 && (
                   <p className="text-xs text-red-400 mb-2">⚠️ Low balance! Top up to go Online.</p>
                 )}
                 <p className="text-xs text-slate-500 mb-3">Commission (20%) deducted per completed job.</p>
@@ -321,7 +321,6 @@ export default function WorkerDashboard() {
                 </button>
               </div>
 
-              {/* Earnings */}
               <div className="glass-card flex flex-col justify-center border-emerald-500/20 relative overflow-hidden">
                 <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/10 rounded-full blur-2xl" />
                 <div className="flex items-center space-x-4 mb-4">
@@ -341,7 +340,6 @@ export default function WorkerDashboard() {
               </div>
             </div>
 
-            {/* Active Jobs */}
             <div className="glass-card">
               <h3 className="text-xl font-bold text-white mb-6">Active Jobs</h3>
 
@@ -365,29 +363,27 @@ export default function WorkerDashboard() {
                             }`}>
                               {job.status === 'arrived' ? '📍 You Arrived' : '🚗 En Route'}
                             </span>
-                            <span className="text-slate-500 text-xs">{job.id}</span>
+                            <span className="text-slate-500 text-xs">{job.id.substring(0,8)}</span>
                           </div>
-                          <h4 className="text-xl font-bold text-white">{job.customerName}</h4>
-                          <p className="text-slate-400 text-sm mt-1 capitalize">{job.serviceType}</p>
+                          <h4 className="text-xl font-bold text-white">{job.customer_name}</h4>
+                          <p className="text-slate-400 text-sm mt-1 capitalize">{job.service_type}</p>
                           <p className="text-slate-500 text-sm mt-1 line-clamp-2">{job.description}</p>
                         </div>
                         <div className="shrink-0 text-right">
                           <p className="text-xs text-slate-500">You'll earn</p>
-                          <p className="text-xl font-black text-emerald-400">Rs. 500</p>
-                          <p className="text-xs text-orange-400">-Rs. 100 commission</p>
+                          <p className="text-xl font-black text-emerald-400">Rs. {job.price}</p>
+                          <p className="text-xs text-orange-400">-Rs. {job.price * 0.20} commission</p>
                         </div>
                       </div>
 
-                      {/* Commission info bar */}
                       <div className="bg-orange-500/10 border border-orange-500/20 rounded-xl p-3 mb-4 flex items-start gap-2">
                         <AlertCircle className="w-4 h-4 text-orange-400 shrink-0 mt-0.5" />
                         <p className="text-xs text-orange-300">
-                          <b>Rs. 100 commission</b> will be deducted from your wallet when you mark this job complete.
-                          Collect <b>Rs. 500 in cash</b> from the customer directly. Platform takes nothing from the customer.
+                          <b>Rs. {job.price * 0.20} commission</b> will be deducted from your wallet when you mark this job complete.
+                          Collect <b>Rs. {job.price} in cash</b> from the customer directly. Platform takes nothing from the customer.
                         </p>
                       </div>
 
-                      {/* Action buttons */}
                       <div className="flex flex-col sm:flex-row gap-3">
                         {job.status === 'assigned' && (
                           <button
@@ -413,7 +409,6 @@ export default function WorkerDashboard() {
                         </button>
                       </div>
 
-                      {/* Customer cancel protection notice */}
                       {job.status === 'arrived' && (
                         <div className="mt-3 bg-green-900/20 border border-green-500/20 rounded-xl p-3 flex items-start gap-2">
                           <ShieldAlert className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
@@ -428,7 +423,6 @@ export default function WorkerDashboard() {
               )}
             </div>
 
-            {/* Top-up Modal */}
             {showTopUp && (
               <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
                 <motion.div

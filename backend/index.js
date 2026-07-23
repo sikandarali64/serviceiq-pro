@@ -1,89 +1,72 @@
 import express from 'express';
 import cors from 'cors';
+import { supabase } from './db.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- IN-MEMORY DATA ---
-let workers = [
-  { id: 'w1', name: 'Ali Hassan', skill: 'electrician', distance: 1.2, rating: 4.9, isAvailable: true },
-  { id: 'w2', name: 'Ahmed Khan', skill: 'plumber', distance: 2.1, rating: 4.7, isAvailable: true },
-  { id: 'w3', name: 'Sara Malik', skill: 'cleaner', distance: 0.8, rating: 4.8, isAvailable: true },
-  { id: 'w4', name: 'Usman Ali', skill: 'AC repair', distance: 3.2, rating: 4.6, isAvailable: true },
-  { id: 'w5', name: 'Fatima Sheikh', skill: 'electrician', distance: 1.8, rating: 4.5, isAvailable: true },
-  { id: 'w6', name: 'Bilal Ahmed', skill: 'plumber', distance: 1.5, rating: 4.9, isAvailable: true },
-  { id: 'w7', name: 'Zara Khan', skill: 'cleaner', distance: 2.4, rating: 4.7, isAvailable: false },
-  { id: 'w8', name: 'Tariq Mahmood', skill: 'AC repair', distance: 0.9, rating: 4.8, isAvailable: true }
-];
-
-let jobs = [
-  // 5 completed
-  { id: 'j1', type: 'plumber', description: 'Leaking pipe', location: 'Block A', status: 'Completed', assignedWorkerId: 'w2', createdAt: new Date(Date.now() - 100000000).toISOString() },
-  { id: 'j2', type: 'electrician', description: 'No power', location: 'Main St', status: 'Completed', assignedWorkerId: 'w1', createdAt: new Date(Date.now() - 90000000).toISOString() },
-  { id: 'j3', type: 'cleaner', description: 'Deep cleaning', location: 'Office 5', status: 'Completed', assignedWorkerId: 'w3', createdAt: new Date(Date.now() - 80000000).toISOString() },
-  { id: 'j4', type: 'AC repair', description: 'Not cooling', location: 'Tower B', status: 'Completed', assignedWorkerId: 'w8', createdAt: new Date(Date.now() - 70000000).toISOString() },
-  { id: 'j5', type: 'plumber', description: 'Blocked drain', location: 'Block C', status: 'Completed', assignedWorkerId: 'w6', createdAt: new Date(Date.now() - 60000000).toISOString() },
-  // 3 assigned
-  { id: 'j6', type: 'electrician', description: 'Sparking wire', location: 'Downtown', status: 'Assigned', assignedWorkerId: 'w5', createdAt: new Date(Date.now() - 5000000).toISOString() },
-  { id: 'j7', type: 'cleaner', description: 'Regular cleaning', location: 'Building 1', status: 'Assigned', assignedWorkerId: 'w3', createdAt: new Date(Date.now() - 4000000).toISOString() },
-  { id: 'j8', type: 'AC repair', description: 'Weird noise', location: 'Sector 4', status: 'Assigned', assignedWorkerId: 'w4', createdAt: new Date(Date.now() - 3000000).toISOString() },
-  // 2 pending
-  { id: 'j9', type: 'plumber', description: 'Broken tap', location: 'Avenue 2', status: 'Pending', assignedWorkerId: null, createdAt: new Date().toISOString() },
-  { id: 'j10', type: 'electrician', description: 'Lighting installation', location: 'Mall', status: 'Pending', assignedWorkerId: null, createdAt: new Date().toISOString() }
-];
-
-let decisionLogs = [];
+const COMMISSION_RATE = 0.20;
 
 // --- AI AUTO-ASSIGNMENT LOGIC ---
-const assignJob = (job) => {
+const assignJob = async (jobId, serviceType, customerLocation = 0) => {
   const startTime = performance.now();
   
+  // Fetch available workers matching skill
+  const { data: availableWorkers, error } = await supabase
+    .from('workers')
+    .select('*')
+    .eq('skill', serviceType)
+    .eq('is_available', true)
+    .gte('wallet_balance', 100);
+
+  if (error || !availableWorkers || availableWorkers.length === 0) {
+    return null;
+  }
+
   let bestWorker = null;
   let maxScore = -1;
-  let candidateScores = [];
 
-  workers.forEach(w => {
-    // strict skill match or we can assign anyway with 0 points? Usually skill match is required.
-    // Let's assume skillMatch gives 30, if not match we skip them or give 0? Realistically we skip them for wrong skill.
-    if (w.skill !== job.type) return;
-
-    const skillMatch = 1; // Since we filtered, it's 1
-    const isAvailable = w.isAvailable ? 1 : 0;
-    
+  availableWorkers.forEach(w => {
     // Formula: score = (1/distance * 40) + (skillMatch * 30) + (rating * 20) + (isAvailable * 10)
-    const distanceScore = (1 / w.distance) * 40;
-    const score = distanceScore + (skillMatch * 30) + (w.rating * 20) + (isAvailable * 10);
+    // Distance can be random or based on worker's seeded distance relative to customer.
+    const distanceVal = Math.abs(w.distance - customerLocation) || 0.1;
+    const distanceScore = (1 / distanceVal) * 40;
+    const skillMatch = 1; 
+    const isAvailable = 1;
     
-    candidateScores.push({ worker: w, score });
-
-    if (score > maxScore && w.isAvailable) { // only assign if available
+    const score = distanceScore + (skillMatch * 30) + (Number(w.rating) * 20) + (isAvailable * 10);
+    
+    if (score > maxScore) {
       maxScore = score;
       bestWorker = w;
     }
   });
 
-  const endTime = performance.now();
-  const duration = ((endTime - startTime) / 1000).toFixed(3); // in seconds
-
   if (bestWorker) {
-    job.status = 'Assigned';
-    job.assignedWorkerId = bestWorker.id;
-    bestWorker.isAvailable = false; // Mark as busy now
+    const duration = ((performance.now() - startTime) / 1000).toFixed(3);
+    const reasoning = `${bestWorker.name} selected — distance ${bestWorker.distance}km, ${bestWorker.skill}, rating ${bestWorker.rating}, available. Assigned in ${duration}s.`;
 
-    const logEntry = {
-      id: `log_${Date.now()}`,
-      jobId: job.id,
-      workerName: bestWorker.name,
-      skill: bestWorker.skill,
-      distance: bestWorker.distance,
-      rating: bestWorker.rating,
-      score: maxScore.toFixed(2),
-      duration: duration, // Simulated fake time or real execution time. Usually AI is fast but for demo we can add a small padding or just use real.
-      timestamp: new Date().toISOString(),
-      reasoning: `${bestWorker.name} selected \u2014 ${bestWorker.distance}km away, ${bestWorker.skill}, rating ${bestWorker.rating}, available. Assigned in ${duration} seconds.`
-    };
-    decisionLogs.unshift(logEntry); // Add to top
+    // 1. Update job
+    await supabase.from('jobs').update({
+      worker_id: bestWorker.id,
+      status: 'assigned',
+      ai_reasoning: reasoning
+    }).eq('id', jobId);
+
+    // 2. Update worker status
+    await supabase.from('workers').update({
+      is_available: false
+    }).eq('id', bestWorker.id);
+
+    // 3. Log decision
+    const { data: logEntry } = await supabase.from('ai_decision_logs').insert([{
+      job_id: jobId,
+      worker_id: bestWorker.id,
+      reasoning: reasoning,
+      score: maxScore
+    }]).select().single();
+
     return logEntry;
   }
   return null;
@@ -92,141 +75,209 @@ const assignJob = (job) => {
 // --- ENDPOINTS ---
 
 // GET /api/workers
-app.get('/api/workers', (req, res) => {
-  res.json(workers);
+app.get('/api/workers', async (req, res) => {
+  const { data, error } = await supabase.from('workers').select('*').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 });
 
 // GET /api/jobs
-app.get('/api/jobs', (req, res) => {
-  // Join worker info
-  const jobsWithWorkers = jobs.map(j => {
-    const worker = workers.find(w => w.id === j.assignedWorkerId);
-    return { ...j, worker };
-  });
-  res.json(jobsWithWorkers);
+app.get('/api/jobs', async (req, res) => {
+  const { data, error } = await supabase.from('jobs').select('*, workers(*)').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  
+  // Format to match old structure (worker object nested)
+  const formatted = data.map(j => ({
+    ...j,
+    worker: j.workers
+  }));
+  res.json(formatted);
 });
 
 // GET /api/admin/metrics
-app.get('/api/admin/metrics', (req, res) => {
-  const totalJobsToday = jobs.filter(j => new Date(j.createdAt).toDateString() === new Date().toDateString()).length;
-  // Let's just use all jobs for demo if totalJobsToday is low
-  const totalJobs = jobs.length;
-  const activeWorkers = workers.filter(w => w.isAvailable).length;
-  const completedJobs = jobs.filter(j => j.status === 'Completed').length;
+app.get('/api/admin/metrics', async (req, res) => {
+  const { data: jobs } = await supabase.from('jobs').select('*');
+  const { data: workers } = await supabase.from('workers').select('*');
   
-  // Demand by category
+  const totalJobs = jobs?.length || 0;
+  const activeWorkers = workers?.filter(w => w.is_available).length || 0;
+  const completedJobs = jobs?.filter(j => j.status === 'completed').length || 0;
+  const cancelledJobs = jobs?.filter(j => j.status === 'cancelled').length || 0;
+  
+  const workerCommissions = jobs?.filter(j => j.status === 'completed').reduce((sum, j) => sum + Number(j.commission_deducted || 100), 0) || 0;
+  const registrationFees = (workers?.length || 0) * 150;
+  const revenue = workerCommissions + registrationFees;
+
   const demand = {};
-  jobs.forEach(j => {
-    demand[j.type] = (demand[j.type] || 0) + 1;
+  jobs?.forEach(j => {
+    demand[j.service_type] = (demand[j.service_type] || 0) + 1;
   });
-  
   const demandsArray = Object.keys(demand).map(key => ({ name: key, value: demand[key] }));
 
-  res.json({
-    totalJobs: totalJobs, // Using total instead of today for better UI look
-    activeWorkers,
-    completedJobs,
-    avgResponseTime: "1.4s", // Mocked or calculated from logs
-    demands: demandsArray
-  });
+  res.json({ totalJobs, activeWorkers, completedJobs, cancelledJobs, revenue, demands: demandsArray });
 });
 
 // GET /api/admin/logs
-app.get('/api/admin/logs', (req, res) => {
-  res.json(decisionLogs);
+app.get('/api/admin/logs', async (req, res) => {
+  const { data, error } = await supabase.from('ai_decision_logs').select('*, jobs(id), workers(name, skill, distance, rating)').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  
+  const formatted = data.map(l => ({
+    id: l.id,
+    jobId: l.job_id,
+    workerName: l.workers?.name,
+    skill: l.workers?.skill,
+    distance: l.workers?.distance,
+    rating: l.workers?.rating,
+    score: l.score,
+    reasoning: l.reasoning,
+    timestamp: l.created_at
+  }));
+  res.json(formatted);
 });
 
 // POST /api/jobs (Submit job)
-app.post('/api/jobs', (req, res) => {
-  const { type, description, location } = req.body;
-  const newJob = {
-    id: `j${Date.now()}`,
-    type,
+app.post('/api/jobs', async (req, res) => {
+  const { name, serviceType, description, location } = req.body;
+  
+  const { data: newJob, error } = await supabase.from('jobs').insert([{
+    customer_name: name,
+    service_type: serviceType,
     description,
     location,
-    status: 'Pending',
-    assignedWorkerId: null,
-    createdAt: new Date().toISOString()
-  };
-  jobs.push(newJob);
-  
-  // Auto assign
-  const log = assignJob(newJob);
+    status: 'pending',
+    ai_reasoning: 'Finding expert...'
+  }]).select().single();
 
+  if (error) return res.status(500).json({ error: error.message });
+  
+  // Auto assign async
+  const log = await assignJob(newJob.id, serviceType, parseFloat(location) || 0);
+  
   res.status(201).json({ job: newJob, log });
 });
 
 // PUT /api/jobs/:id/status
-app.put('/api/jobs/:id/status', (req, res) => {
-  const { status } = req.body;
-  const job = jobs.find(j => j.id === req.params.id);
-  if (job) {
-    job.status = status;
-    if (status === 'Completed' && job.assignedWorkerId) {
-      const worker = workers.find(w => w.id === job.assignedWorkerId);
-      if (worker) worker.isAvailable = true; // free the worker
+app.put('/api/jobs/:id/status', async (req, res) => {
+  const { status, cancelledBy, workerArrived } = req.body;
+  const jobId = req.params.id;
+
+  const { data: job, error: jobError } = await supabase.from('jobs').select('*').eq('id', jobId).single();
+  if (jobError) return res.status(404).json({ message: 'Job not found' });
+
+  const updates = { status };
+  if (cancelledBy) updates.cancelled_by = cancelledBy;
+  if (workerArrived !== undefined) updates.worker_arrived = workerArrived;
+
+  if (status === 'completed' && job.worker_id) {
+    const commission = Math.round(Number(job.price || 500) * COMMISSION_RATE);
+    updates.commission_deducted = commission;
+    updates.completed_at = new Date().toISOString();
+
+    const { data: worker } = await supabase.from('workers').select('*').eq('id', job.worker_id).single();
+    if (worker) {
+      const newBalance = Number(worker.wallet_balance) - commission;
+      const newStatus = newBalance >= 100;
+
+      await supabase.from('workers').update({
+        wallet_balance: newBalance,
+        is_available: newStatus
+      }).eq('id', worker.id);
+
+      await supabase.from('wallet_transactions').insert([{
+        worker_id: worker.id,
+        amount: -commission,
+        type: 'commission'
+      }]);
     }
-    res.json(job);
-  } else {
-    res.status(404).json({ message: 'Job not found' });
+  } else if (status === 'cancelled' && job.worker_id) {
+    await supabase.from('workers').update({ is_available: true }).eq('id', job.worker_id);
   }
+
+  const { data: updatedJob, error } = await supabase.from('jobs').update(updates).eq('id', jobId).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json(updatedJob);
 });
 
 // PUT /api/workers/:id/status
-app.put('/api/workers/:id/status', (req, res) => {
+app.put('/api/workers/:id/status', async (req, res) => {
   const { isAvailable } = req.body;
-  const worker = workers.find(w => w.id === req.params.id);
-  if (worker) {
-    worker.isAvailable = isAvailable;
-    res.json(worker);
-  } else {
-    res.status(404).json({ message: 'Worker not found' });
-  }
+  const { data, error } = await supabase.from('workers').update({ is_available: isAvailable }).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /api/workers/:id/topup
+app.post('/api/workers/:id/topup', async (req, res) => {
+  const { amount } = req.body;
+  const workerId = req.params.id;
+
+  const { data: worker } = await supabase.from('workers').select('wallet_balance').eq('id', workerId).single();
+  if (!worker) return res.status(404).json({ message: 'Worker not found' });
+
+  const newBalance = Number(worker.wallet_balance) + Number(amount);
+  const { data, error } = await supabase.from('workers').update({ wallet_balance: newBalance }).eq('id', workerId).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  await supabase.from('wallet_transactions').insert([{ worker_id: workerId, amount: Number(amount), type: 'topup' }]);
+
+  res.json(data);
 });
 
 // POST /api/workers (Register new worker)
-app.post('/api/workers', (req, res) => {
-  const { name, skill, distance } = req.body;
-  const newWorker = {
-    id: `w${Date.now()}`,
+app.post('/api/workers', async (req, res) => {
+  const { name, cnic, phone, skill, distance, experience } = req.body;
+  const { data, error } = await supabase.from('workers').insert([{
     name,
+    cnic,
+    phone,
     skill,
-    distance: parseFloat(distance) || 2.5, // Default distance if not provided
-    rating: 5.0, // New workers start with 5.0
-    isAvailable: true
-  };
-  workers.push(newWorker);
-  res.status(201).json(newWorker);
+    distance: parseFloat(distance) || 2.5,
+    rating: 5.0,
+    is_available: true,
+    wallet_balance: 500
+  }]).select().single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+// POST /api/customers/warn
+app.post('/api/customers/warn', async (req, res) => {
+  const { name } = req.body;
+  
+  let { data: customer } = await supabase.from('customers').select('*').eq('name', name).single();
+  
+  if (customer) {
+    const warnings = (customer.warning_strikes || 0) + 1;
+    const isBanned = warnings >= 3;
+    const { data } = await supabase.from('customers').update({ warning_strikes: warnings, is_banned: isBanned }).eq('id', customer.id).select().single();
+    return res.json(data);
+  } else {
+    const { data } = await supabase.from('customers').insert([{ name, warning_strikes: 1 }]).select().single();
+    return res.json(data);
+  }
 });
 
 // POST /api/admin/simulate
-app.post('/api/admin/simulate', (req, res) => {
-  // Simulate emergency job
-  const types = ['electrician', 'plumber', 'cleaner', 'AC repair'];
-  const type = types[Math.floor(Math.random() * types.length)];
+app.post('/api/admin/simulate', async (req, res) => {
+  const types = ['electrician', 'plumber', 'house_cleaning', 'ac_repair', 'fridge_repair', 'curtain_cleaning'];
+  const serviceType = types[Math.floor(Math.random() * types.length)];
   
-  const emergencyJob = {
-    id: `j${Date.now()}`,
-    type,
-    description: `EMERGENCY: ${type} needed immediately!`,
+  const { data: newJob } = await supabase.from('jobs').insert([{
+    customer_name: 'Emergency System',
+    service_type: serviceType,
+    description: `EMERGENCY: ${serviceType} needed immediately!`,
     location: 'Central Plaza',
-    status: 'Pending',
-    assignedWorkerId: null,
-    createdAt: new Date().toISOString()
-  };
-  
-  jobs.push(emergencyJob);
+    status: 'pending',
+    ai_reasoning: 'Finding expert...'
+  }]).select().single();
 
-  // We add an artificial delay to make it seem like AI is "scanning" (e.g. 1.8s)
-  setTimeout(() => {
-    const log = assignJob(emergencyJob);
-    // Override log duration for demo effect
-    if(log) {
-       log.duration = (Math.random() * (2.0 - 1.2) + 1.2).toFixed(2); // Random between 1.2s and 2.0s
-       log.reasoning = `${log.workerName} selected \u2014 ${log.distance}km away, ${log.skill}, rating ${log.rating}, available. Assigned in ${log.duration} seconds.`;
-    }
-    res.json({ job: emergencyJob, log });
-  }, 1000); // Wait 1 sec before returning so UI can show loading
+  setTimeout(async () => {
+    const log = await assignJob(newJob.id, serviceType, 2.5);
+    res.json({ job: newJob, log });
+  }, 1000);
 });
 
 const PORT = process.env.PORT || 5005;
@@ -237,4 +288,3 @@ const server = app.listen(PORT, () => {
 server.on('error', (err) => {
   console.error('Server failed to start:', err);
 });
-
